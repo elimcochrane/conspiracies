@@ -1,0 +1,526 @@
+---
+title: "Conspiracy Expression as Intelligence Signaling"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+    code-fold: show
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+This document reproduces the full analysis pipeline for the study. It reads the public dataset, derives the multi-item scales, and writes every table and model to `./outputs/`. Running it top to bottom regenerates all reported results.
+
+**Input:**
+
+- `Conspiracies_Public.csv` — one row per participant: demographics, written response, raw survey items (moderators, manipulation checks, GCBS), LIWC-22 output, ConspEmoLLM score, and LOCO discriminability score.
+
+## Setup
+
+```{r}
+#| label: libraries
+library(tidyverse)
+library(broom)
+library(psych)
+library(ppcor)
+library(effectsize)
+library(emmeans)
+library(pwr)
+library(conflicted)
+
+conflicts_prefer(dplyr::select, dplyr::filter, dplyr::mutate, dplyr::summarize)
+
+dir.create("outputs", showWarnings = FALSE)
+
+# Factor reference levels, fixed once so every coefficient sign is interpretable.
+PUB_LEVELS <- c("private", "public")   # reference = private
+MOT_LEVELS <- c("control", "savvy")    # reference = control; savvy = intelligence condition
+
+add_factors <- function(d) {
+  d |>
+    mutate(
+      publicness = if_else(str_detect(condition, "^public_"), "public", "private"),
+      motivation = if_else(str_detect(condition, "_savvy$"), "savvy", "control"),
+      publicness = factor(publicness, levels = PUB_LEVELS),
+      motivation = factor(motivation, levels = MOT_LEVELS)
+    )
+}
+
+# Tidy a model with 95% CIs and write it to outputs/.
+save_model <- function(fit, file, extra = NULL) {
+  out <- broom::tidy(fit, conf.int = TRUE)
+  if (!is.null(extra)) out <- bind_cols(out, extra)
+  write_csv(out, file.path("outputs", file))
+  out
+}
+```
+
+## 1. Load data and derive scales
+
+```{r}
+#| label: clean
+raw <- read_csv("Conspiracies_Public.csv")
+
+# Reverse-coded items and scale means. Raw items are retained in the public file;
+# the scored scales below are derived here so the pipeline is fully reproducible.
+df <- raw |>
+  mutate(
+    mod_8_rev  = 7 - moderators_8,  mod_10_rev = 7 - moderators_10,
+    mod_20_rev = 7 - moderators_20, mod_23_rev = 7 - moderators_23,
+    mod_24_rev = 7 - moderators_24, mod_29_rev = 7 - moderators_29,
+    manip_3_rev = 7 - manip_3,      manip_6_rev = 7 - manip_6,
+
+    sanu = rowMeans(pick(moderators_1:moderators_4), na.rm = TRUE),
+    pres_modify = rowMeans(pick(moderators_5:moderators_7, mod_8_rev, moderators_9, mod_10_rev, moderators_11), na.rm = TRUE),
+    pres_variability = rowMeans(pick(moderators_12:moderators_18), na.rm = TRUE),
+    closure = rowMeans(pick(moderators_19, mod_20_rev, moderators_21:moderators_22, mod_23_rev,
+                            mod_24_rev, moderators_25:moderators_28, mod_29_rev, moderators_30), na.rm = TRUE),
+    savviness_check  = rowMeans(pick(manip_1, manip_2, manip_3_rev), na.rm = TRUE),
+    publicness_check = rowMeans(pick(manip_4, manip_5, manip_6_rev), na.rm = TRUE),
+    gcbs_conspiracism = rowMeans(pick(gcbs_1:gcbs_7), na.rm = TRUE)
+  ) |>
+  select(-ends_with("_rev")) |>
+  add_factors()
+
+# df carries everything (raw items + scales + LIWC block WC:Emoji).
+df_full <- df
+
+# Analysed sample sizes.
+tibble(n_total = nrow(df), n_by_condition = list(table(df$condition))) |>
+  mutate(n_by_condition = map_chr(n_by_condition, ~paste(names(.x), .x, sep = "=", collapse = "; "))) |>
+  write_csv("outputs/00_sample_sizes.csv")
+```
+
+## 2. Demographics
+
+```{r}
+#| label: demographics
+age <- as.numeric(df$age)
+
+demo_summary <- tibble(
+  n_total  = nrow(df),
+  age_mean = mean(age, na.rm = TRUE),
+  age_sd   = sd(age, na.rm = TRUE),
+  age_min  = min(age, na.rm = TRUE),
+  age_max  = max(age, na.rm = TRUE)
+)
+write_csv(demo_summary, "outputs/01_demographics_summary.csv")
+
+df |>
+  count(political_affiliation, name = "n") |>
+  write_csv("outputs/01_demographics_politics.csv")
+
+if ("sex" %in% names(df)) {
+  df |> count(sex, name = "n") |> write_csv("outputs/01_demographics_gender.csv")
+}
+```
+
+## 3. Reliabilities (Cronbach's alpha)
+
+```{r}
+#| label: alphas
+df2 <- read_csv("Conspiracies_Public.csv") |>
+  mutate(
+    mod_8_rev = 7 - moderators_8,  mod_10_rev = 7 - moderators_10,
+    mod_20_rev = 7 - moderators_20, mod_23_rev = 7 - moderators_23,
+    mod_24_rev = 7 - moderators_24, mod_29_rev = 7 - moderators_29,
+    manip_3_rev = 7 - manip_3,      manip_6_rev = 7 - manip_6
+  )
+
+scales <- list(
+  SANU             = df2 |> select(moderators_1:moderators_4),
+  pres_modify      = df2 |> select(moderators_5, moderators_6, moderators_7, mod_8_rev, moderators_9, mod_10_rev, moderators_11),
+  pres_variability = df2 |> select(moderators_12:moderators_18),
+  closure          = df2 |> select(moderators_19, mod_20_rev, moderators_21, moderators_22, mod_23_rev, mod_24_rev, moderators_25, moderators_26, moderators_27, moderators_28, mod_29_rev, moderators_30),
+  GCBS             = df2 |> select(gcbs_1:gcbs_7),
+  savviness_check  = df2 |> select(manip_1, manip_2, manip_3_rev),
+  publicness_check = df2 |> select(manip_4, manip_5, manip_6_rev)
+)
+
+alpha_tbl <- imap_dfr(scales, function(items, nm) {
+  a <- suppressWarnings(psych::alpha(items, check.keys = TRUE))
+  tibble(scale = nm, k_items = ncol(items), raw_alpha = a$total$raw_alpha)
+})
+write_csv(alpha_tbl, "outputs/02_reliabilities.csv")
+alpha_tbl
+```
+
+## 4. Manipulation checks
+
+```{r}
+#| label: manip-checks
+mc_savvy <- aov(savviness_check  ~ motivation, data = df)
+mc_pub   <- aov(publicness_check ~ publicness, data = df)
+
+manip_tbl <- bind_rows(
+  broom::tidy(mc_savvy) |> mutate(check = "savviness ~ motivation"),
+  broom::tidy(mc_pub)   |> mutate(check = "publicness ~ publicness")
+) |>
+  filter(term != "Residuals") |>
+  left_join(
+    bind_rows(
+      as_tibble(eta_squared(mc_savvy, partial = TRUE)) |> mutate(check = "savviness ~ motivation"),
+      as_tibble(eta_squared(mc_pub,   partial = TRUE)) |> mutate(check = "publicness ~ publicness")
+    ) |>
+      rename_with(~"eta2", matches("^Eta2(_partial)?$")) |>
+      select(check, eta2),
+    by = "check"
+  )
+
+write_csv(manip_tbl, "outputs/03_manipulation_checks.csv")
+manip_tbl
+```
+
+## 5. LIWC descriptives
+
+```{r}
+#| label: liwc-descriptives
+liwc_vars <- df_full |> select(WC:Emoji) |> names()
+
+df_full |>
+  summarize(.by = condition, across(all_of(liwc_vars), ~mean(.x, na.rm = TRUE))) |>
+  write_csv("outputs/04_liwc_by_condition.csv")
+
+df_full |>
+  summarize(.by = publicness, across(all_of(liwc_vars), ~mean(.x, na.rm = TRUE))) |>
+  write_csv("outputs/04_liwc_by_publicness.csv")
+
+df_full |>
+  summarize(.by = motivation, across(all_of(liwc_vars), ~mean(.x, na.rm = TRUE))) |>
+  write_csv("outputs/04_liwc_by_motivation.csv")
+
+# Analytic and Clout cell means with SE (used in the figures and text).
+df_full |>
+  summarize(.by = c(publicness, motivation),
+            analytic_m = mean(Analytic, na.rm = TRUE), analytic_se = sd(Analytic, na.rm = TRUE) / sqrt(n()),
+            power_m    = mean(power,    na.rm = TRUE), power_se    = sd(power,    na.rm = TRUE) / sqrt(n()),
+            n = n()) |>
+  write_csv("outputs/04_analytic_power_cellmeans.csv")
+```
+
+## 6. LIWC 2×2 ANOVAs (partial eta\^2, FDR-corrected)
+
+```{r}
+#| label: liwc-anovas
+liwc_anova <- map_dfr(liwc_vars, function(v) {
+  fit <- aov(reformulate("publicness * motivation", response = sprintf("`%s`", v)), data = df_full)
+  es  <- as_tibble(eta_squared(fit, partial = TRUE)) |> select(term = Parameter, eta2_partial = Eta2_partial)
+  broom::tidy(fit) |>
+    filter(term != "Residuals") |>
+    left_join(es, by = "term") |>
+    mutate(variable = v)
+})
+
+liwc_anova <- liwc_anova |>
+  mutate(p_adjusted = p.adjust(p.value, method = "fdr")) |>
+  relocate(variable)
+
+write_csv(liwc_anova, "outputs/05_liwc_anova_ALL.csv")
+
+liwc_anova |>
+  filter(p_adjusted < .05) |>
+  arrange(p_adjusted) |>
+  write_csv("outputs/05_liwc_anova_sig.csv")
+```
+
+## 7. ConspEmoLLM: primary DV analyses
+
+```{r}
+#| label: conspllm-load
+# ConspEmoLLM scores are already columns in df (from the merged public file).
+consp <- df
+```
+
+### 7a. Condition effect (2×2 ANOVA, cell means, eta\^2)
+
+```{r}
+#| label: conspllm-anova
+aov_consp <- aov(conspllm_score ~ publicness * motivation, data = consp)
+save_model(aov_consp, "06_conspllm_anova.csv")
+
+as_tibble(eta_squared(aov_consp, partial = TRUE)) |>
+  write_csv("outputs/06_conspllm_anova_eta2.csv")
+
+consp |>
+  summarize(.by = c(publicness, motivation),
+            mean = mean(conspllm_score, na.rm = TRUE),
+            sd = sd(conspllm_score, na.rm = TRUE), n = n()) |>
+  write_csv("outputs/06_conspllm_cellmeans.csv")
+```
+
+### 7b. Moderator regressions on ConspEmoLLM (coefficients + 95% CI)
+
+```{r}
+#| label: conspllm-moderation
+mods <- c("sanu", "pres_modify", "pres_variability", "closure")
+
+consp_mod_tbl <- map_dfr(mods, function(m) {
+  bind_rows(
+    save_model(lm(reformulate(sprintf("publicness * %s", m), "conspllm_score"), data = consp),
+               sprintf("07_conspllm_pub_x_%s.csv", m)) |> mutate(model = sprintf("publicness*%s", m)),
+    save_model(lm(reformulate(sprintf("motivation * %s", m), "conspllm_score"), data = consp),
+               sprintf("07_conspllm_mot_x_%s.csv", m)) |> mutate(model = sprintf("motivation*%s", m)),
+    save_model(lm(reformulate(sprintf("publicness * motivation * %s", m), "conspllm_score"), data = consp),
+               sprintf("07_conspllm_full_x_%s.csv", m)) |> mutate(model = sprintf("pub*mot*%s", m))
+  )
+})
+write_csv(consp_mod_tbl, "outputs/07_conspllm_moderation_ALL.csv")
+```
+
+## 8. GCBS (belief) analyses
+
+### 8a. GCBS by 2×2 cell
+
+```{r}
+#| label: gcbs-cellmeans
+df |>
+  summarize(.by = c(publicness, motivation),
+            gcbs_mean = mean(gcbs_conspiracism, na.rm = TRUE),
+            gcbs_sd = sd(gcbs_conspiracism, na.rm = TRUE), n = n()) |>
+  arrange(desc(gcbs_mean)) |>
+  write_csv("outputs/08_gcbs_cellmeans.csv")
+
+save_model(aov(gcbs_conspiracism ~ publicness * motivation, data = df),
+           "08_gcbs_anova.csv")
+```
+
+### 8b. GCBS moderator regressions
+
+```{r}
+#| label: gcbs-moderation
+gcbs_mod_tbl <- map_dfr(mods, function(m) {
+  bind_rows(
+    save_model(lm(reformulate(sprintf("publicness * %s", m), "gcbs_conspiracism"), data = df),
+               sprintf("09_gcbs_pub_x_%s.csv", m)) |> mutate(model = sprintf("publicness*%s", m)),
+    save_model(lm(reformulate(sprintf("motivation * %s", m), "gcbs_conspiracism"), data = df),
+               sprintf("09_gcbs_mot_x_%s.csv", m)) |> mutate(model = sprintf("motivation*%s", m)),
+    save_model(lm(reformulate(sprintf("publicness * motivation * %s", m), "gcbs_conspiracism"), data = df),
+               sprintf("09_gcbs_full_x_%s.csv", m)) |> mutate(model = sprintf("pub*mot*%s", m))
+  )
+})
+write_csv(gcbs_mod_tbl, "outputs/09_gcbs_moderation_ALL.csv")
+```
+
+### 8c. Motivation × SANU simple slopes on GCBS
+
+```{r}
+#| label: gcbs-simple-slopes
+sanu_model <- lm(gcbs_conspiracism ~ motivation * sanu, data = df)
+save_model(sanu_model, "10_gcbs_mot_x_sanu_model.csv")
+
+m_s  <- mean(df$sanu, na.rm = TRUE)
+sd_s <- sd(df$sanu, na.rm = TRUE)
+
+emm <- emmeans(sanu_model, ~ motivation | sanu,
+               at = list(sanu = c(m_s - sd_s, m_s, m_s + sd_s)))
+as_tibble(pairs(emm)) |> write_csv("outputs/10_gcbs_sanu_simple_slopes.csv")
+```
+
+### 8d. Three-way crossover: motivation × SANU × publicness
+
+```{r}
+#| label: gcbs-threeway
+full <- lm(gcbs_conspiracism ~ publicness * motivation * sanu, data = df)
+save_model(full, "10_gcbs_threeway_model.csv")
+
+# Model-based motivation effect at low/high SANU, within each audience, with 95% CIs.
+emm_cross <- emmeans(full, ~ motivation | publicness * sanu,
+                     at = list(sanu = c(m_s - sd_s, m_s + sd_s)))
+as_tibble(confint(contrast(emm_cross, "revpairwise", by = c("publicness", "sanu")))) |>
+  write_csv("outputs/10_gcbs_crossover_contrasts.csv")
+
+# SANU slope within each of the four cells.
+as_tibble(emtrends(full, ~ publicness * motivation, var = "sanu")) |>
+  write_csv("outputs/10_gcbs_sanu_slopes_by_cell.csv")
+
+# Motivation × SANU interaction within each audience separately.
+map_dfr(c("private", "public"), function(p) {
+  fit <- lm(gcbs_conspiracism ~ motivation * sanu, data = subset(df, publicness == p))
+  broom::tidy(fit, conf.int = TRUE) |>
+    filter(term == "motivationsavvy:sanu") |>
+    mutate(publicness = p)
+}) |>
+  write_csv("outputs/10_gcbs_interaction_by_audience.csv")
+```
+
+### 8e. Crossover figure
+
+```{r}
+#| label: gcbs-crossover-figure
+df_fig <- df |>
+  mutate(
+    publicness = factor(publicness, levels = c("private", "public"), labels = c("Private", "Public")),
+    motivation = factor(motivation, levels = c("control", "savvy"), labels = c("Control", "Intelligence")),
+    sanu_grp = factor(if_else(sanu > median(sanu, na.rm = TRUE), "High", "Low"), levels = c("Low", "High"))
+  )
+
+plot_df <- df_fig |>
+  summarize(.by = c(sanu_grp, publicness, motivation),
+            mean = mean(gcbs_conspiracism, na.rm = TRUE),
+            se   = sd(gcbs_conspiracism, na.rm = TRUE) / sqrt(n()))
+
+ggplot(plot_df, aes(x = motivation, y = mean, group = sanu_grp, color = sanu_grp)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.12, linewidth = 0.6) +
+  facet_wrap(~ publicness) +
+  scale_color_manual(values = c("Low" = "#B0392B", "High" = "#2C5F8A"), name = "Need for\nUniqueness") +
+  labs(x = "Motivation Condition", y = "Conspiracy Belief (GCBS)") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), strip.text = element_text(face = "bold"))
+```
+
+## 9. ConspEmoLLM × LIWC partial correlations
+
+```{r}
+#| label: partial-cors
+# Partial correlations between the ConspEmoLLM score and each LIWC dimension,
+# controlling for the 2x2 design. GCBS is excluded here and handled in 9b.
+consp_var <- "conspllm_score"
+cond_vars <- c("publicness", "motivation")
+
+# LIWC dimensions are the WC:Emoji block; select them explicitly so raw survey
+# items and demographics are not mistaken for LIWC output.
+liwc_only <- consp |>
+  select(WC:Emoji) |>
+  select(where(is.numeric)) |>
+  names()
+
+ctrl <- model.matrix(~ publicness * motivation, data = consp)[, -1, drop = FALSE]
+
+pcor_results <- map_dfr(liwc_only, function(v) {
+  d <- data.frame(x = consp[[consp_var]], y = consp[[v]], ctrl)
+  d <- d[complete.cases(d), ]
+  if (nrow(d) < 10 || sd(d$y) == 0) return(NULL)
+  r <- pcor.test(d$x, d$y, d[, -(1:2)], method = "pearson")
+  tibble(liwc_dim = v, n = r$n, rho_partial = r$estimate, p.value = r$p.value)
+}) |>
+  mutate(p_adjusted = p.adjust(p.value, method = "fdr")) |>
+  arrange(p_adjusted, desc(abs(rho_partial)))
+
+write_csv(pcor_results, "outputs/11_conspllm_liwc_partial_correlations.csv")
+pcor_results |> filter(p_adjusted < .05) |>
+  write_csv("outputs/11_conspllm_liwc_partial_correlations_sig.csv")
+
+sig <- pcor_results |> filter(p_adjusted < .05)
+tibble(n_sig_liwc = nrow(sig),
+       max_abs_r  = if (nrow(sig)) max(abs(sig$rho_partial)) else NA_real_,
+       min_abs_r  = if (nrow(sig)) min(abs(sig$rho_partial)) else NA_real_) |>
+  write_csv("outputs/11_partial_cor_summary.csv")
+```
+
+### 9b. ConspEmoLLM ↔ GCBS convergent validity
+
+```{r}
+#| label: conspllm-gcbs-convergent
+d <- data.frame(x = consp$conspllm_score, y = consp$gcbs_conspiracism, ctrl)
+d <- d[complete.cases(d), ]
+r <- pcor.test(d$x, d$y, d[, -(1:2)], method = "pearson")
+
+tibble(measure = "conspllm_score ~ gcbs_conspiracism | condition",
+       n = r$n, rho_partial = r$estimate, p.value = r$p.value) |>
+  write_csv("outputs/11b_conspllm_gcbs_convergent.csv")
+
+zero <- cor.test(consp$conspllm_score, consp$gcbs_conspiracism)
+tibble(measure = "conspllm_score ~ gcbs_conspiracism (zero-order)",
+       n = sum(complete.cases(consp$conspllm_score, consp$gcbs_conspiracism)),
+       r = unname(zero$estimate), p.value = zero$p.value) |>
+  write_csv("outputs/11b_conspllm_gcbs_zeroorder.csv")
+```
+
+## 10. ConspEmoLLM × LIWC within-cell correlations and slope moderation
+
+```{r}
+#| label: within-cell-and-moderation
+# (a) Within-cell Spearman correlations.
+by_cell <- consp |>
+  group_by(publicness, motivation) |>
+  group_modify(function(d, key) {
+    map_dfr(liwc_only, function(v) {
+      ok <- complete.cases(d[[consp_var]], d[[v]])
+      if (sum(ok) < 10 || sd(d[[v]][ok]) == 0) return(NULL)
+      ct <- suppressWarnings(cor.test(d[[consp_var]][ok], d[[v]][ok], method = "spearman"))
+      tibble(liwc_dim = v, n = sum(ok), rho = unname(ct$estimate), p.value = ct$p.value)
+    })
+  }) |>
+  ungroup() |>
+  mutate(p_adjusted = p.adjust(p.value, method = "fdr"))
+write_csv(by_cell, "outputs/12_conspllm_liwc_by_condition.csv")
+
+# (b) Formal moderation: does condition move the conspiracism-LIWC slope?
+moderation <- map_dfr(liwc_only, function(v) {
+  d <- consp |> select(all_of(c(v, consp_var, cond_vars))) |> drop_na()
+  if (nrow(d) < 20 || sd(d[[v]]) == 0) return(NULL)
+  f_full <- reformulate(sprintf("%s * publicness * motivation", consp_var), sprintf("`%s`", v))
+  f_null <- reformulate(sprintf("%s + publicness * motivation", consp_var), sprintf("`%s`", v))
+  cmp <- anova(lm(f_null, data = d), lm(f_full, data = d))
+  tibble(liwc_dim = v, n = nrow(d), F = cmp$F[2], df1 = cmp$Df[2],
+         df2 = cmp$Res.Df[2], p.value = cmp$`Pr(>F)`[2])
+}) |>
+  mutate(p_adjusted = p.adjust(p.value, method = "fdr")) |>
+  arrange(p_adjusted)
+write_csv(moderation, "outputs/12_conspllm_liwc_moderation.csv")
+```
+
+## 11. LOCO (secondary measure)
+
+```{r}
+#| label: loco
+# LOCO discriminability is already a column in df (from the merged public file).
+loco <- df
+
+save_model(aov(loco_discriminability ~ condition, data = loco), "13_loco_anova.csv")
+
+loco |>
+  summarize(.by = c(publicness, motivation),
+            mean = mean(loco_discriminability, na.rm = TRUE),
+            sd = sd(loco_discriminability, na.rm = TRUE), n = n()) |>
+  write_csv("outputs/13_loco_cellmeans.csv")
+
+# Response length by cell (register diagnostic).
+consp |>
+  summarize(.by = c(publicness, motivation),
+            wc_mean = mean(WC, na.rm = TRUE), wc_sd = sd(WC, na.rm = TRUE), n = n()) |>
+  write_csv("outputs/13_response_length_by_cell.csv")
+```
+
+## 12. Power analyses
+
+```{r}
+#| label: power
+# Realized sample size drives all post-hoc df.
+N <- nrow(df)
+
+# A priori: total N required for a small-to-medium effect (f = .15) at 80% power,
+# one-way k = 4. This is the planning target, not the realized sample.
+apriori_n <- pwr.anova.test(k = 4, f = 0.15, sig.level = .05, power = .80)$n * 4
+
+power_rows <- tibble(
+  analysis = c("a priori required N (f = .15, 80% power, k = 4)",
+               "publicness main effect (f2 = .04)",
+               "motivation x SANU interaction (f2 = .0076)",
+               "three-way interaction (f2 = .0072)"),
+  value = c(
+    apriori_n,
+    pwr.f2.test(u = 1, v = N - 2, f2 = 0.04   / (1 - 0.04),   sig.level = .05)$power,
+    pwr.f2.test(u = 1, v = N - 4, f2 = 0.0076 / (1 - 0.0076), sig.level = .05)$power,
+    pwr.f2.test(u = 1, v = N - 8, f2 = 0.0072 / (1 - 0.0072), sig.level = .05)$power
+  )
+)
+write_csv(power_rows, "outputs/14_power.csv")
+power_rows
+```
+
+## 13. Output manifest
+
+```{r}
+#| label: manifest
+tibble(file = list.files("outputs", full.names = FALSE)) |>
+  arrange(file) |>
+  write_csv("outputs/_MANIFEST.csv")
+
+list.files("outputs")
+```
